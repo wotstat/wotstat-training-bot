@@ -2,6 +2,7 @@
 import BigWorld
 import re
 import types
+import sys
 from PlayerEvents import g_playerEvents
 from constants import PREBATTLE_TYPE
 from adisp import adisp_process, adisp_async
@@ -16,7 +17,7 @@ INVITE_COOLDOWN = 15.0
 
 # Auto-reconnect settings
 RECONNECT_INTERVAL = 30.0  # seconds between reconnect attempts
-TARGET_SERVER_NAME = 'RU2'  # server name to reconnect to
+
 
 # Minimum similarity threshold (0.0 to 1.0) for fuzzy vehicle matching
 # 0.5 means at least 50% of characters must match
@@ -30,6 +31,129 @@ def log(msg):
 def debug(msg):
     if DEBUG_MODE:
         print('[MOD_WOTSTAT_TRAINING_BOT] [DEBUG] %s' % msg)
+
+
+# Default values
+DEFAULT_TARGET_SERVER_NAME = 'RU2'
+DEFAULT_ALLOWED_PLAYERS = []
+DEFAULT_ALLOWED_PLAYERS_REGEX = []
+
+# Parse arguments at module load time
+TARGET_SERVER_NAME = 'RU2'
+ALLOWED_PLAYERS = []
+ALLOWED_PLAYERS_REGEX = []
+
+# ModsSettings API linkage
+MOD_LINKAGE = 'wotstat.training-bot'
+
+MOD_SETTINGS_TEMPLATE = {
+    'modDisplayName': 'WotStat Training Bot',
+    'settingsVersion': 1,
+    'enabled': True,
+    'column1': [
+        {
+            'type': 'Label',
+            'text': 'Server Settings',
+        },
+        {
+            'type': 'TextInput',
+            'text': 'Target Server Name',
+            'width': 200,
+            'value': DEFAULT_TARGET_SERVER_NAME,
+            'varName': 'targetServerName',
+            'tooltip': '{HEADER}Target Server{/HEADER}{BODY}Server name for auto-reconnect (e.g. RU2, RU1){/BODY}',
+        },
+        {
+            'type': 'Empty',
+        },
+        {
+            'type': 'Label',
+            'text': 'Allowed Players',
+        },
+        {
+            'type': 'TextInput',
+            'text': 'Exact Player Names (comma separated)',
+            'width': 350,
+            'value': '',
+            'varName': 'allowedPlayers',
+            'tooltip': '{HEADER}Allowed Players{/HEADER}{BODY}Comma separated list of exact player names allowed to send training invites. Leave empty to accept from everyone.{/BODY}',
+        },
+    ],
+    'column2': [
+        {
+            'type': 'Label',
+            'text': '\xc2\xa0',
+        },
+        {
+            'type': 'TextInput',
+            'text': 'Regex Patterns (comma separated)',
+            'width': 350,
+            'value': '',
+            'varName': 'allowedPlayersRegex',
+            'tooltip': '{HEADER}Regex Patterns{/HEADER}{BODY}Comma separated list of regex patterns for allowed player names. Leave empty to skip regex matching.{/BODY}',
+        },
+    ],
+}
+
+
+def _applySettings(settings):
+    """Apply settings from ModsSettings API to global variables."""
+    global TARGET_SERVER_NAME, ALLOWED_PLAYERS, ALLOWED_PLAYERS_REGEX
+
+    if settings is None:
+        return
+
+    # Target server name
+    serverName = settings.get('targetServerName', '').strip()
+    if serverName:
+        TARGET_SERVER_NAME = serverName
+    else:
+        TARGET_SERVER_NAME = DEFAULT_TARGET_SERVER_NAME
+
+    # Allowed players (comma separated)
+    playersStr = settings.get('allowedPlayers', '').strip()
+    if playersStr:
+        ALLOWED_PLAYERS = [p.strip() for p in playersStr.split(',') if p.strip()]
+    else:
+        ALLOWED_PLAYERS = list(DEFAULT_ALLOWED_PLAYERS)
+
+    # Allowed players regex (comma separated)
+    regexStr = settings.get('allowedPlayersRegex', '').strip()
+    if regexStr:
+        ALLOWED_PLAYERS_REGEX = [p.strip() for p in regexStr.split(',') if p.strip()]
+    else:
+        ALLOWED_PLAYERS_REGEX = list(DEFAULT_ALLOWED_PLAYERS_REGEX)
+
+    log('Settings applied: target_server=%s, allowed_players=%s, allowed_players_regex=%s'
+        % (TARGET_SERVER_NAME, ALLOWED_PLAYERS, ALLOWED_PLAYERS_REGEX))
+
+
+def _onModSettingsChanged(linkage, settings):
+    """Callback for ModsSettings API when settings change."""
+    if linkage != MOD_LINKAGE:
+        return
+    log('Settings changed via ModsSettings API')
+    _applySettings(settings)
+
+
+def _initModsSettings():
+    """Initialize ModsSettings API integration."""
+    try:
+        from gui.modsSettingsApi import g_modsSettingsApi
+
+        savedSettings = g_modsSettingsApi.getModSettings(MOD_LINKAGE, MOD_SETTINGS_TEMPLATE)
+        if savedSettings:
+            _applySettings(savedSettings)
+            g_modsSettingsApi.registerCallback(MOD_LINKAGE, _onModSettingsChanged)
+        else:
+            settings = g_modsSettingsApi.setModTemplate(MOD_LINKAGE, MOD_SETTINGS_TEMPLATE, _onModSettingsChanged)
+            _applySettings(settings)
+
+        log('ModsSettings API initialized')
+    except ImportError:
+        log('ModsSettings API not available, using default settings')
+    except Exception as e:
+        log('Error initializing ModsSettings API: %s' % str(e))
 
 
 def safeEncode(s):
@@ -553,6 +677,35 @@ class TrainingBotController(object):
             self._declineInvite(inviteID)
             return
 
+        # Check if inviter is in allowed players list (if list is not empty)
+        if ALLOWED_PLAYERS or ALLOWED_PLAYERS_REGEX:
+            inviterName = self._getInviterName(invite)
+            if inviterName:
+                isAllowed = False
+                
+                # Check exact name matches
+                if ALLOWED_PLAYERS and inviterName in ALLOWED_PLAYERS:
+                    log('Accepting invite from allowed player: %s' % inviterName)
+                    isAllowed = True
+                
+                # Check regex patterns if exact match failed
+                if not isAllowed and ALLOWED_PLAYERS_REGEX:
+                    for pattern in ALLOWED_PLAYERS_REGEX:
+                        try:
+                            if re.match(pattern, inviterName):
+                                log('Accepting invite from player matching regex "%s": %s' % (pattern, inviterName))
+                                isAllowed = True
+                                break
+                        except Exception as e:
+                            log('Error matching regex pattern "%s": %s' % (pattern, str(e)))
+                
+                if not isAllowed:
+                    log('Declining invite from non-allowed player: %s' % inviterName)
+                    self._declineInvite(inviteID)
+                    return
+            else:
+                log('Warning: Could not determine inviter name, accepting anyway')
+
         # Check cooldown
         currentTime = BigWorld.time()
         timeSinceLastAccept = currentTime - self._lastAcceptedTime
@@ -602,6 +755,19 @@ class TrainingBotController(object):
         except Exception as e:
             log('Error checking prebattle state: %s' % str(e))
             return False
+
+    def _getInviterName(self, invite):
+        """Get the name of the player who sent the invite."""
+        try:
+            if hasattr(invite, 'creator') and invite.creator:
+                return invite.creator
+            
+            log('Warning: Could not determine inviter name from invite')
+            return None
+            
+        except Exception as e:
+            log('Error getting inviter name: %s' % str(e))
+            return None
 
     def _declineInvite(self, inviteID):
         """Decline an invite explicitly."""
@@ -1104,6 +1270,13 @@ g_controller = TrainingBotController()
 
 def init():
     log('Loaded v%s' % VERSION)
+    _initModsSettings()
+    log('Configuration: target_server=%s, allowed_players=%s, allowed_players_regex=%s' % (TARGET_SERVER_NAME, ALLOWED_PLAYERS, ALLOWED_PLAYERS_REGEX))
+    if not ALLOWED_PLAYERS and not ALLOWED_PLAYERS_REGEX:
+        log('No player restrictions: accepting invites from any player')
+    else:
+        restrictionCount = len(ALLOWED_PLAYERS) + len(ALLOWED_PLAYERS_REGEX)
+        log('Player restrictions enabled: %d exact names, %d regex patterns' % (len(ALLOWED_PLAYERS), len(ALLOWED_PLAYERS_REGEX)))
     g_reconnectController.start()
     g_controller.start()
 
