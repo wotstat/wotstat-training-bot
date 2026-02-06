@@ -6,7 +6,7 @@
 
 Auto accept invites to training rooms in World of Tanks and Mir Tankov.
 
-<video src="https://github.com/user-attachments/assets/8f3952b2-e41f-40e0-9f71-966041a22e85" controls autoplay loop muted></video>
+![Demo video](https://github.com/user-attachments/assets/8f3952b2-e41f-40e0-9f71-966041a22e85)
 
 ## Как пользоваться
 1. Только на сервере **`RU2`**.
