@@ -6,7 +6,7 @@
 
 Auto accept invites to training rooms in World of Tanks and Mir Tankov.
 
-![Training Bot Demo](./.github/demo.webm)
+<video src="./.github/demo.webm" controls autoplay loop muted></video>
 
 ## Как пользоваться
 1. Только на сервере **`RU2`**.
