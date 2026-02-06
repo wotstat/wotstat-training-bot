@@ -14,6 +14,10 @@ DEBUG_MODE = '{{DEBUG_MODE}}'
 # Cooldown time in seconds before accepting a new invite
 INVITE_COOLDOWN = 15.0
 
+# Auto-reconnect settings
+RECONNECT_INTERVAL = 30.0  # seconds between reconnect attempts
+TARGET_SERVER_NAME = 'RU2'  # server name to reconnect to
+
 # Minimum similarity threshold (0.0 to 1.0) for fuzzy vehicle matching
 # 0.5 means at least 50% of characters must match
 VEHICLE_MATCH_THRESHOLD = 0.5
@@ -148,6 +152,246 @@ def findBestVehicleMatch(query, vehicles):
     if bestScore >= VEHICLE_MATCH_THRESHOLD:
         return (bestMatch, bestScore)
     return (None, 0.0)
+
+
+class AutoReconnectController(object):
+    """
+    Controller for automatically reconnecting to RU2 server
+    when disconnected due to server restart or error.
+    """
+    
+    def __init__(self):
+        self._initialized = False
+        self._reconnectCallback = None
+        self._isReconnecting = False
+        self._originalShowDisconnect = None
+        self._suppressDisconnectDialog = False
+        self._connectionMgr = None
+    
+    def start(self):
+        """Start listening for disconnect events."""
+        if self._initialized:
+            return
+        
+        log('Starting AutoReconnectController')
+        self._initialized = True
+        
+        # Subscribe to disconnect event
+        g_playerEvents.onDisconnected += self._onDisconnected
+        g_playerEvents.onAccountShowGUI += self._onAccountShowGUI
+        
+        # Subscribe to connection manager events
+        try:
+            from skeletons.connection_mgr import IConnectionManager
+            self._connectionMgr = dependency.instance(IConnectionManager)
+            if self._connectionMgr:
+                self._connectionMgr.onRejected += self._onConnectionRejected
+        except Exception as e:
+            log('Error subscribing to connection manager: %s' % str(e))
+        
+        # Patch showDisconnect to suppress error dialogs during reconnect
+        self._patchShowDisconnect()
+        
+        log('AutoReconnectController initialized')
+    
+    def stop(self):
+        """Stop listening and cleanup."""
+        if not self._initialized:
+            return
+        
+        log('Stopping AutoReconnectController')
+        self._initialized = False
+        
+        # Unsubscribe from events
+        g_playerEvents.onDisconnected -= self._onDisconnected
+        g_playerEvents.onAccountShowGUI -= self._onAccountShowGUI
+        
+        # Unsubscribe from connection manager
+        if self._connectionMgr:
+            try:
+                self._connectionMgr.onRejected -= self._onConnectionRejected
+            except Exception:
+                pass
+            self._connectionMgr = None
+        
+        # Restore original showDisconnect
+        self._restoreShowDisconnect()
+        
+        # Cancel pending reconnect
+        self._cancelReconnect()
+    
+    def _patchShowDisconnect(self):
+        """Patch showDisconnect to suppress dialog during auto-reconnect."""
+        try:
+            from gui import DialogsInterface
+            if hasattr(DialogsInterface, 'showDisconnect'):
+                self._originalShowDisconnect = DialogsInterface.showDisconnect
+                
+                def patchedShowDisconnect(reason=None, kickReasonType=None, expiryTime=None):
+                    if self._suppressDisconnectDialog:
+                        log('Suppressing disconnect dialog for auto-reconnect')
+                        return
+                    # Import here to get the correct default value
+                    from constants import ACCOUNT_KICK_REASONS
+                    if kickReasonType is None:
+                        kickReasonType = ACCOUNT_KICK_REASONS.UNKNOWN
+                    return self._originalShowDisconnect(reason, kickReasonType, expiryTime)
+                
+                DialogsInterface.showDisconnect = patchedShowDisconnect
+                log('Patched showDisconnect')
+        except Exception as e:
+            log('Error patching showDisconnect: %s' % str(e))
+    
+    def _restoreShowDisconnect(self):
+        """Restore original showDisconnect function."""
+        try:
+            if self._originalShowDisconnect is not None:
+                from gui import DialogsInterface
+                DialogsInterface.showDisconnect = self._originalShowDisconnect
+                self._originalShowDisconnect = None
+                log('Restored showDisconnect')
+        except Exception as e:
+            log('Error restoring showDisconnect: %s' % str(e))
+    
+    def _onAccountShowGUI(self, ctx):
+        """Called when successfully connected and in lobby."""
+        log('Successfully connected to server')
+        self._suppressDisconnectDialog = False
+        self._isReconnecting = False
+        self._cancelReconnect()
+    
+    def _onConnectionRejected(self, status, responseData):
+        """Called when connection attempt is rejected."""
+        log('Connection rejected (status=%s), will retry in %.0f seconds' % (status, RECONNECT_INTERVAL))
+        self._isReconnecting = False
+        self._scheduleReconnect()
+    
+    def _onDisconnected(self):
+        """Called when player is disconnected from server."""
+        log('Disconnected from server, scheduling reconnect in %.0f seconds' % RECONNECT_INTERVAL)
+        self._suppressDisconnectDialog = True
+        self._scheduleReconnect()
+    
+    def _scheduleReconnect(self):
+        """Schedule a reconnect attempt."""
+        self._cancelReconnect()
+        self._reconnectCallback = BigWorld.callback(RECONNECT_INTERVAL, self._doReconnect)
+    
+    def _cancelReconnect(self):
+        """Cancel pending reconnect callback."""
+        if self._reconnectCallback is not None:
+            try:
+                BigWorld.cancelCallback(self._reconnectCallback)
+            except Exception:
+                pass
+            self._reconnectCallback = None
+    
+    def _findTargetServer(self):
+        """Find the target server (RU2) from predefined hosts."""
+        try:
+            from predefined_hosts import g_preDefinedHosts
+            
+            # Get all available hosts
+            hosts = g_preDefinedHosts.hosts()
+            
+            for host in hosts:
+                # Check if server name contains our target
+                if TARGET_SERVER_NAME.lower() in host.name.lower():
+                    log('Found target server: %s (url: %s, peripheryID: %s)' % (
+                        host.name, host.url, host.peripheryID))
+                    return host
+                if TARGET_SERVER_NAME.lower() in host.shortName.lower():
+                    log('Found target server by short name: %s (url: %s)' % (
+                        host.shortName, host.url))
+                    return host
+            
+            log('Target server %s not found in host list' % TARGET_SERVER_NAME)
+            # Log available servers for debugging
+            for host in hosts:
+                debug('Available server: name=%s, shortName=%s, url=%s' % (
+                    host.name, host.shortName, host.url))
+            
+            return None
+        except Exception as e:
+            log('Error finding target server: %s' % str(e))
+            return None
+    
+    def _doReconnect(self):
+        """Attempt to reconnect to the target server."""
+        self._reconnectCallback = None
+        
+        if self._isReconnecting:
+            log('Reconnect already in progress, skipping')
+            return
+        
+        log('Attempting to reconnect to %s...' % TARGET_SERVER_NAME)
+        self._isReconnecting = True
+        
+        try:
+            from skeletons.gui.login_manager import ILoginManager
+            
+            loginManager = dependency.instance(ILoginManager)
+            
+            if loginManager is None:
+                log('LoginManager not available, will retry')
+                self._isReconnecting = False
+                self._scheduleReconnect()
+                return
+            
+            # Find target server
+            targetHost = self._findTargetServer()
+            
+            if targetHost is None:
+                log('Could not find target server, will retry')
+                self._isReconnecting = False
+                self._scheduleReconnect()
+                return
+            
+            serverUrl = targetHost.url
+            
+            # Try to login via WGC (Wargaming Game Center)
+            if hasattr(loginManager, 'wgcAvailable') and loginManager.wgcAvailable:
+                log('Attempting WGC login to %s' % serverUrl)
+                loginManager.tryWgcLogin(serverUrl)
+            elif hasattr(loginManager, 'lgcAvailable') and loginManager.lgcAvailable:
+                log('Attempting LGC login to %s' % serverUrl)
+                loginManager.tryLgcLogin(serverUrl)
+            else:
+                # Fallback: try to use token2 relogin if available
+                log('WGC not available, trying token2 relogin')
+                token2 = loginManager.getPreference('token2')
+                login = loginManager.getPreference('login')
+                
+                if token2 and login:
+                    log('Using stored credentials for relogin')
+                    loginManager.initiateRelogin(login, token2, serverUrl)
+                else:
+                    log('No stored credentials available, cannot auto-reconnect')
+                    self._suppressDisconnectDialog = False
+                    self._isReconnecting = False
+                    return
+            
+            # Reset reconnecting flag after a delay
+            # (connection result will come through events)
+            BigWorld.callback(5.0, self._onReconnectAttemptComplete)
+            
+        except Exception as e:
+            log('Error during reconnect: %s' % str(e))
+            self._isReconnecting = False
+            self._scheduleReconnect()
+    
+    def _onReconnectAttemptComplete(self):
+        """Called after reconnect attempt to reset state if no events fired."""
+        # Only reset if we're still in reconnecting state
+        # This acts as a fallback in case events don't fire
+        if self._isReconnecting:
+            log('Reconnect attempt timed out, scheduling retry')
+            self._isReconnecting = False
+            self._scheduleReconnect()
+
+
+# Global auto-reconnect controller instance
+g_reconnectController = AutoReconnectController()
 
 
 class TrainingBotController(object):
@@ -860,9 +1104,11 @@ g_controller = TrainingBotController()
 
 def init():
     log('Loaded v%s' % VERSION)
+    g_reconnectController.start()
     g_controller.start()
 
 
 def fini():
     log('Unloading')
     g_controller.stop()
+    g_reconnectController.stop()
