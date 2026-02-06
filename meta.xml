@@ -1,0 +1,6 @@
+<root>
+  <id>wotstat.training-bot</id>
+  <version>{{VERSION}}</version>
+  <name>wotstat.training-bot</name>
+  <description>Auto enter training room</description>
+</root>
