@@ -3,6 +3,7 @@ import BigWorld
 import re
 import types
 import sys
+from Avatar import PlayerAvatar, _INIT_STEPS
 from PlayerEvents import g_playerEvents
 from constants import PREBATTLE_TYPE
 from adisp import adisp_process, adisp_async
@@ -534,6 +535,8 @@ class TrainingBotController(object):
         self._initialized = False
         self._checkReadyCallback = None
         self._chatSubscribed = False
+        self._originalOnInitStepCompleted = None
+        self._originalWorldDrawEnabled = None
 
     def start(self):
         """Start listening for events."""
@@ -548,8 +551,9 @@ class TrainingBotController(object):
         g_playerEvents.onAvatarReady += self._onAvatarReady
         g_playerEvents.onPrebattleJoined += self._onPrebattleJoined
         g_playerEvents.onPrebattleLeft += self._onPrebattleLeft
-        self.hangarSpace.onSpaceCreate += self._onSpaceLoaded
-        
+
+        # Patch functions we need for full disabled game 3D graphics
+        self._patchDisabledGraphics()
 
         log('Subscribed to player events')
 
@@ -562,7 +566,6 @@ class TrainingBotController(object):
         self._initialized = False
 
         # Unsubscribe from player events
-        self.hangarSpace.onSpaceCreate -= self._onSpaceLoaded
         g_playerEvents.onAccountShowGUI -= self._onAccountShowGUI
         g_playerEvents.onAvatarReady -= self._onAvatarReady
         g_playerEvents.onPrebattleJoined -= self._onPrebattleJoined
@@ -576,29 +579,6 @@ class TrainingBotController(object):
 
         # Cancel any pending callbacks
         self._cancelCheckReadyCallback()
-
-    def _onSpaceLoaded(self):
-        """Called when a new space (hangar or battle) is loaded."""
-        debug('Space loaded, disabling rendering')
-        if not DEBUG_MODE:
-            # Small delay to ensure space is fully loaded
-            BigWorld.callback(0, self._disableRendering)
-
-    def _disableRendering(self):
-        """Disable 3D world rendering to save GPU resources."""
-        try:
-            BigWorld.worldDrawEnabled(False)
-            log('3D rendering disabled')
-        except Exception as e:
-            log('Failed to disable 3D rendering: %s' % str(e))
-
-    def _enableRendering(self):
-        """Enable 3D world rendering."""
-        try:
-            BigWorld.worldDrawEnabled(True)
-            log('3D rendering enabled')
-        except Exception as e:
-            log('Failed to enable 3D rendering: %s' % str(e))
 
     def _onAccountShowGUI(self, ctx):
         """Called when player enters the lobby (hangar)."""
@@ -950,6 +930,7 @@ class TrainingBotController(object):
                 log('Player set to ready')
             else:
                 log('Failed to set ready, will retry')
+                self._selectAvailableVehicle()
                 self._scheduleSetReady()
 
         except Exception as e:
@@ -1030,6 +1011,33 @@ class TrainingBotController(object):
 
         except Exception as e:
             log('Error selecting available vehicle: %s' % str(e))
+
+    def _patchDisabledGraphics(self):
+        """Patch functions we need for full disabled game 3D graphics"""
+        try:
+            self._originalOnInitStepCompleted = PlayerAvatar._PlayerAvatar__onInitStepCompleted
+
+            def _onAvatarInitCompleted(baseSelf):
+                """After _INIT_STEPS.INIT_COMPLETED client can't continue battle loading when world draw disabled. We just send client ready command to server via communicating with BaseApp."""
+                self._originalOnInitStepCompleted(baseSelf)
+                if baseSelf._PlayerAvatar__initProgress == (_INIT_STEPS.ALL_STEPS_PASSED | _INIT_STEPS.INIT_COMPLETED):
+                    baseSelf.setClientReady()
+
+            """Hook avatar init complete function to send "client is ready" command"""
+            PlayerAvatar._PlayerAvatar__onInitStepCompleted = _onAvatarInitCompleted
+
+            self._originalWorldDrawEnabled = BigWorld.worldDrawEnabled
+
+            def _lockWorldDrawDisabled(value=None):
+                """When BigWorld.worldDrawEnabled calls without any argument, we need to return current world draw status. Of course, it's false. =D"""
+                if value is None:
+                    return False
+                return self._originalWorldDrawEnabled(False)
+
+            """Hook to lock world draw disabled"""
+            BigWorld.worldDrawEnabled = _lockWorldDrawDisabled
+        except Exception as e:
+            log('Error while patching disabled graphics: %s' % str(e))
 
     def _subscribeToChat(self):
         """Subscribe to chat messages in training room."""
